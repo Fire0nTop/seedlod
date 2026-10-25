@@ -1,0 +1,15 @@
+{
+  "required": true,
+  "package": "dev.seedlod.mixin",
+  "compatibilityLevel": "JAVA_17",
+  "mixins": [
+    "ChunkGeneratorAccessor",
+    "NoiseBasedChunkGeneratorAccessor"
+  ],
+  "client": [
+    "MinecraftMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

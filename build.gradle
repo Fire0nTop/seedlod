@@ -1,0 +1,73 @@
+plugins {
+    id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    exclusiveContent {
+        forRepository {
+            maven {
+                name = "Modrinth"
+                url = "https://api.modrinth.com/maven"
+            }
+        }
+        filter {
+            includeGroup "maven.modrinth"
+        }
+    }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+    // Voxy is the LOD engine we write into; Sodium is its hard dependency.
+    implementation "maven.modrinth:voxy:${project.voxy_version}"
+    runtimeOnly "maven.modrinth:sodium:${project.sodium_version}"
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = 25
+    it.options.encoding = "UTF-8"
+}
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_25
+    targetCompatibility = JavaVersion.VERSION_25
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.archives_base_name}" }
+    }
+}
+
+loom {
+    runs {
+        configureEach {
+            // Voxy's RocksDB can't create files under very long Windows paths; if the project lives deep in the
+            // filesystem, point the dev game somewhere short with -PdevRunDir=<path relative to the project>
+            runDir project.findProperty("devRunDir") ?: "run"
+            // Same flags the vanilla/Lunar launchers pass; without them the dev client crashes in native graphics code on Windows
+            vmArg "-XX:StackShadowPages=32"
+            vmArg "-XX:HeapDumpPath=MojangTricksIntelDriversForPerformance_javaw.exe_minecraft.exe.heapdump"
+        }
+        server {
+            runDir project.findProperty("devServerRunDir") ?: "run/server"
+        }
+    }
+}

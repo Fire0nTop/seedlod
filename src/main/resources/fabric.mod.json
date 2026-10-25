@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "seedlod",
+  "version": "${version}",
+  "name": "SeedLOD for Voxy",
+  "description": "Fills Voxy's LODs straight from the world seed, at the resolution Voxy draws them.",
+  "authors": ["badhe"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.seedlod.SeedLodClient"]
+  },
+  "mixins": ["seedlod.mixins.json"],
+  "depends": {
+    "minecraft": "~26.3",
+    "fabricloader": ">=0.19.5",
+    "fabric-api": "*",
+    "voxy": ">=0.2.20-beta",
+    "java": ">=25"
+  }
+}
