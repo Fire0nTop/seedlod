@@ -188,13 +188,15 @@ public final class GenerationJob {
             this.visited.incrementAndGet();
 
             int lvl = this.targetLevel(dx, dz);
+            // A structure needs its real blocks; Voxy shrinks them down for the distance like any other terrain
+            if (lvl > 0 && this.terrain.structuresTouch(cx, cz)) lvl = 0;
             byte previous = this.done.get(key);
             if (previous <= lvl) continue;
             if (this.isProtected(cx, cz)) continue;
             // Data we didn't write ourselves is real terrain; data we did write may be refined
             if ((this.explored != null && this.explored.isExplored(cx, cz))
                     || (previous == DoneMap.NONE && this.stored.has(cx, cz))) {
-                this.done.put(key, 0);
+                this.done.put(key, DoneMap.REAL);
                 continue;
             }
 

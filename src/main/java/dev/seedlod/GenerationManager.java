@@ -42,6 +42,8 @@ public final class GenerationManager {
     public static final GenerationManager INSTANCE = new GenerationManager();
     private static final long DEBUG_REPORT_MS = 10_000;
     private static final long SEED_REPLY_TIMEOUT_MS = 10_000;
+    // The server sends its MOTD just after we join; give it this long before generating anything
+    private static final long RULES_GRACE_MS = 3_000;
 
     @Nullable private GenerationJob job;
     private boolean jobIsManual;
@@ -54,6 +56,9 @@ public final class GenerationManager {
     private int lastCenterX, lastCenterZ;
     @Nullable private ResourceKey<Level> lastCenterDim;
     private long awaitingSeedSince;
+    private ServerRules rules = ServerRules.NONE;
+    private long joinedAt;
+    @Nullable private String lastMotd;
 
     private GenerationManager() {}
 
@@ -91,6 +96,7 @@ public final class GenerationManager {
         if (this.awaitingSeedSince != 0 && System.currentTimeMillis() - this.awaitingSeedSince > SEED_REPLY_TIMEOUT_MS) {
             this.awaitingSeedSince = 0;
         }
+        if (isMultiplayer(mc)) this.checkMotd(mc);
 
         if (this.job != null) {
             this.job.setProtectedChunks(this.playerChunks(mc), this.protectRadius(mc));
@@ -111,6 +117,7 @@ public final class GenerationManager {
         }
 
         if (!SeedLodConfig.INSTANCE.continuous || this.jobIsManual && this.job != null) return;
+        if (isMultiplayer(mc) && System.currentTimeMillis() - this.joinedAt < RULES_GRACE_MS) return;
 
         var cfg = SeedLodConfig.INSTANCE;
         int px = mc.player.chunkPosition().x(), pz = mc.player.chunkPosition().z();
@@ -138,6 +145,9 @@ public final class GenerationManager {
     private void onJoinServer(Minecraft mc) {
         String key = serverKey(mc);
         var known = key == null ? null : SeedLodConfig.INSTANCE.servers.get(key);
+        this.joinedAt = System.currentTimeMillis();
+        // Until the MOTD arrives, go by what this server told us last time (a direct connect may never send one)
+        this.rules = known == null ? ServerRules.NONE : new ServerRules(known.noStructures, known.disabled);
         if (known != null && known.seed != null) return;
         // If we may run /seed, ask the server quietly instead of making the player type it
         var connection = mc.getConnection();
@@ -147,15 +157,68 @@ public final class GenerationManager {
         }
     }
 
-    /** Catches the reply to our automatic /seed. Returns false to hide the message. */
+    // ------------------------------------------------------------------ fair play
+
+    private void checkMotd(Minecraft mc) {
+        var data = mc.getCurrentServer();
+        if (data == null || data.motd == null) return;
+        String text = data.motd.getString();
+        if (text.equals(this.lastMotd)) return;
+        this.lastMotd = text;
+        // The MOTD is the server's current word: a marker missing from it lifts an earlier restriction
+        this.applyRules(mc, ServerRules.parse(text), true);
+    }
+
+    private void applyRules(Minecraft mc, ServerRules found, boolean authoritative) {
+        ServerRules next = authoritative ? found : this.rules.or(found);
+        if (next.equals(this.rules)) return;
+        boolean tighter = this.rules.isLooserThan(next);
+        this.rules = next;
+        String key = serverKey(mc);
+        if (key != null) {
+            var known = SeedLodConfig.INSTANCE.servers.computeIfAbsent(key, k -> new SeedLodConfig.ServerWorld());
+            known.noStructures = next.noStructures();
+            known.disabled = next.disabled();
+            SeedLodConfig.save();
+        }
+        this.stop();
+        if (next.disabled()) {
+            this.message(mc, "SeedLOD: this server has turned SeedLOD off.", ChatFormatting.YELLOW);
+        } else {
+            // Either way what SeedLOD already drew is now wrong (structures it mustn't show, or ones it may show now)
+            this.message(mc, tighter
+                    ? "SeedLOD: this server doesn't allow structures, so they're off here. Redrawing what SeedLOD made without them."
+                    : "SeedLOD: this server allows structures again. Redrawing what SeedLOD made with them.", ChatFormatting.YELLOW);
+            if (key != null) this.redoServerProgress(key);
+        }
+        this.restartSoon();
+    }
+
+    // Regenerates every chunk SeedLOD wrote for this server (in all dimensions), which also removes structures from them
+    private void redoServerProgress(String key) {
+        try (var files = Files.list(serverProgressDir(key))) {
+            files.filter(f -> f.toString().endsWith(".bin")).forEach(f -> {
+                var done = this.doneMaps.computeIfAbsent(f, p -> new DoneMap(p, false));
+                done.redoGenerated();
+                done.save();
+            });
+        } catch (Exception ignored) {
+            // Nothing generated for this server yet
+        }
+    }
+
+    /** Server markers in any chat/system message, and the reply to our automatic /seed. Returns false to hide the message. */
     public boolean onGameMessage(Component message) {
+        var mc = Minecraft.getInstance();
+        if (this.sessionIdentity != null && isMultiplayer(mc)) {
+            this.applyRules(mc, ServerRules.parse(message.getString()), false);
+        }
         if (this.awaitingSeedSince == 0) return true;
         if (!(message.getContents() instanceof TranslatableContents tc) || !tc.getKey().equals("commands.seed.success")) return true;
         if (tc.getArgs().length == 0) return true;
         Object arg = tc.getArgs()[0];
         String text = (arg instanceof Component c ? c.getString() : String.valueOf(arg)).replaceAll("[^0-9-]", "");
         this.awaitingSeedSince = 0;
-        var mc = Minecraft.getInstance();
         try {
             long seed = Long.parseLong(text);
             String result = this.setSeed(mc, Long.toString(seed), false);
@@ -226,10 +289,10 @@ public final class GenerationManager {
         return FabricLoader.getInstance().getConfigDir().resolve("seedlod").resolve("servers").resolve(key.replaceAll("[^a-z0-9._-]", "_"));
     }
 
-    private DoneMap doneMap(Path dir, ResourceKey<Level> dim) {
+    private DoneMap doneMap(Path dir, ResourceKey<Level> dim, boolean regionChecked) {
         var id = dim.identifier();
         Path file = dir.resolve(id.getNamespace() + "_" + id.getPath().replace('/', '_') + ".bin");
-        return this.doneMaps.computeIfAbsent(file, DoneMap::new);
+        return this.doneMaps.computeIfAbsent(file, f -> new DoneMap(f, regionChecked));
     }
 
     @Nullable
@@ -249,6 +312,7 @@ public final class GenerationManager {
         var instance = VoxyCommon.getInstance();
         if (instance == null || !instance.isRunning()) return "Voxy isn't running";
 
+        if (isMultiplayer(mc) && this.rules.disabled()) return "This server has turned SeedLOD off";
         var dim = mc.level.dimension();
         var resolved = this.resolve(mc, dim);
         if (resolved.target == null) return resolved.problem;
@@ -259,8 +323,9 @@ public final class GenerationManager {
 
         this.stop();
         var cfg = SeedLodConfig.INSTANCE;
-        var done = this.doneMap(target.progressDir, dim);
-        var terrain = new SeedTerrain(target.ctx, cfg.trees, cfg.waterFeatures);
+        var done = this.doneMap(target.progressDir, dim, target.explored != null);
+        var terrain = new SeedTerrain(target.ctx, cfg.trees, cfg.waterFeatures,
+                cfg.structures && !(isMultiplayer(mc) && this.rules.noStructures()));
         this.job = new GenerationJob(terrain, engine, instance, done, target.explored, cx, cz, settings);
         this.jobDimension = dim;
         this.job.setProtectedChunks(this.playerChunks(mc), this.protectRadius(mc));
@@ -271,8 +336,9 @@ public final class GenerationManager {
         this.lastReport = System.currentTimeMillis();
         this.lastReportedProblem = null;
         this.job.start();
-        SeedLod.LOGGER.info("Started seed generation in {} around {} {} (radius {}, {} threads, {})",
-                dim.identifier(), cx, cz, settings.radius(), settings.threads(), isMultiplayer(mc) ? "server seed" : "integrated server");
+        SeedLod.LOGGER.info("Started seed generation in {} around {} {} (radius {}, {} threads, {}, structures {})",
+                dim.identifier(), cx, cz, settings.radius(), settings.threads(), isMultiplayer(mc) ? "server seed" : "integrated server",
+                terrain.hasStructures() ? "on" : "off");
         return null;
     }
 
@@ -293,17 +359,17 @@ public final class GenerationManager {
     public void onChunkLoad(Minecraft mc, ResourceKey<Level> dim, int cx, int cz) {
         // The first chunks arrive before our first tick, so don't wait for the session to be set up
         Path dir = this.progressDir(mc);
-        if (dir != null) this.doneMap(dir, dim).put(ChunkPos.pack(cx, cz), 0);
+        if (dir != null) this.doneMap(dir, dim, !isMultiplayer(mc)).put(ChunkPos.pack(cx, cz), DoneMap.REAL);
     }
 
-    /** Forget progress for the current dimension, so the next job regenerates everything not explored. */
+    /** Regenerate everything SeedLOD wrote in the current dimension (e.g. after changing settings); real terrain is kept. */
     public boolean clearProgress(Minecraft mc) {
         if (mc.level == null) return false;
         Path dir = this.progressDir(mc);
         if (dir == null) return false;
         this.stop();
-        var done = this.doneMap(dir, mc.level.dimension());
-        done.clear();
+        var done = this.doneMap(dir, mc.level.dimension(), !isMultiplayer(mc));
+        done.redoGenerated();
         done.save();
         this.lastCenterDim = null;
         return true;
@@ -348,7 +414,9 @@ public final class GenerationManager {
         String key = serverKey(mc);
         var known = key == null ? null : SeedLodConfig.INSTANCE.servers.get(key);
         if (known == null || known.seed == null) return "No seed saved for " + key + ". Use /seedlod seed <seed>.";
-        return "Seed for " + key + ": " + known.seed + " (preset " + known.preset + (known.force ? ", forced" : "") + ")";
+        String rules = this.rules.disabled() ? "; this server has turned SeedLOD off"
+                : this.rules.noStructures() ? "; this server doesn't allow structures" : "";
+        return "Seed for " + key + ": " + known.seed + " (preset " + known.preset + (known.force ? ", forced" : "") + ")" + rules;
     }
 
     public String setPreset(Minecraft mc, String preset) {
@@ -393,6 +461,8 @@ public final class GenerationManager {
         this.lastCenterDim = null;
         this.lastReportedProblem = null;
         this.awaitingSeedSince = 0;
+        this.rules = ServerRules.NONE;
+        this.lastMotd = null;
     }
 
     private long[] playerChunks(Minecraft mc) {

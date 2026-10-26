@@ -1,5 +1,6 @@
 package dev.seedlod.gen;
 
+import dev.seedlod.SeedLod;
 import dev.seedlod.mixin.ChunkGeneratorAccessor;
 import dev.seedlod.mixin.NoiseBasedChunkGeneratorAccessor;
 import me.cortex.voxy.common.voxelization.VoxelizedSection;
@@ -28,8 +29,14 @@ import net.minecraft.world.level.levelgen.NoiseGeneratorSettings;
 import net.minecraft.world.level.levelgen.NoiseSettings;
 import net.minecraft.world.level.levelgen.RandomState;
 import net.minecraft.world.level.levelgen.blending.Blender;
+import net.minecraft.world.level.levelgen.WorldgenRandom;
+import net.minecraft.world.level.levelgen.XoroshiroRandomSource;
+import net.minecraft.world.level.levelgen.structure.BoundingBox;
+import net.minecraft.world.level.levelgen.structure.StructureStart;
 import net.minecraft.world.level.levelgen.densityfunction.DensityVolume;
 import net.minecraft.world.level.levelgen.densityfunction.SamplerContext;
+
+import java.util.List;
 
 /**
  * Turns the world seed into Voxy sections without going through the server's chunk system.
@@ -79,8 +86,9 @@ public final class SeedTerrain {
     final boolean hasCeiling;
     final boolean trees;
     final boolean waterFeatures;
+    @org.jetbrains.annotations.Nullable final StructureIndex structures;
 
-    public SeedTerrain(GenContext ctx, boolean trees, boolean waterFeatures) {
+    public SeedTerrain(GenContext ctx, boolean trees, boolean waterFeatures, boolean structures) {
         this.ctx = ctx;
         var generator = ctx.generator();
         this.generator = generator;
@@ -92,6 +100,16 @@ public final class SeedTerrain {
         this.hasCeiling = ctx.hasCeiling();
         this.trees = trees;
         this.waterFeatures = waterFeatures;
+        this.structures = structures && ctx.templates() != null ? new StructureIndex(ctx) : null;
+    }
+
+    public boolean hasStructures() {
+        return this.structures != null;
+    }
+
+    /** Chunks a structure touches are always generated at full detail, so the structure is really there. */
+    public boolean structuresTouch(int cx, int cz) {
+        return this.structures != null && !this.structures.affecting(cx, cz).isEmpty();
     }
 
     public Worker newWorker() {
@@ -156,9 +174,10 @@ public final class SeedTerrain {
                 return this.climate.getNoiseBiome(qx, qy, qz);
             };
             BiomeManager biomeManager = new BiomeManager(resolver, ctx.biomeZoomSeed());
+            var structureStarts = SeedTerrain.this.structures == null ? List.<StructureStart>of() : SeedTerrain.this.structures.affecting(cx, cz);
 
             try (NoiseChunk noiseChunk = new NoiseChunk(
-                    SeedTerrain.this.randomState, Beardifier.EMPTY, SeedTerrain.this.settings,
+                    SeedTerrain.this.randomState, StructureIndex.beardifier(structureStarts, pos), SeedTerrain.this.settings,
                     accessor.seedlod$globalFluidPicker().get(), Blender.empty(),
                     new DensityVolume(16, noiseSettings.height(), 16, minX, noiseSettings.minY(), minZ))) {
                 var sections = chunk.getSections();
@@ -172,10 +191,42 @@ public final class SeedTerrain {
                         SeedTerrain.this.settings.materialRule().value());
             }
 
-            this.decorateAndWrite(sink, chunk);
+            boolean[] built = structureStarts.isEmpty() ? null : this.placeStructures(chunk, structureStarts, resolver);
+            this.decorateAndWrite(sink, chunk, built);
         }
 
-        private void decorateAndWrite(Sink sink, ProtoChunk chunk) {
+        /** Places every visible structure overlapping this chunk; returns the columns they cover (no trees there). */
+        private boolean[] placeStructures(ProtoChunk chunk, List<StructureStart> starts, BiomeResolver biomes) {
+            var t = SeedTerrain.this;
+            ChunkPos pos = chunk.getPos();
+            int minX = pos.getMinBlockX(), minZ = pos.getMinBlockZ();
+            var chunkBox = new BoundingBox(minX, chunk.getMinY(), minZ, minX + 15, chunk.getMaxY(), minZ + 15);
+            // Seeded like vanilla decoration, so the same seed always gives the same structure details
+            var random = new WorldgenRandom(new XoroshiroRandomSource(0L));
+            long decorationSeed = random.setDecorationSeed(t.seed, minX, minZ);
+            var level = StructureLevel.create(chunk, t.ctx, biomes, random);
+            boolean[] built = new boolean[256];
+            for (int i = 0; i < starts.size(); i++) {
+                StructureStart start = starts.get(i);
+                random.setFeatureSeed(decorationSeed, i, start.getStructure().step().ordinal());
+                try {
+                    start.placeInChunk(level, null, t.generator, random, chunkBox, pos);
+                } catch (Exception e) {
+                    // A piece wanting something only a real world has; the rest of the structure still stands
+                    SeedLod.LOGGER.debug("Structure piece failed in chunk {}", pos, e);
+                }
+                for (var piece : start.getPieces()) {
+                    var box = piece.getBoundingBox();
+                    if (!box.intersects(chunkBox)) continue;
+                    for (int z = Math.max(box.minZ(), minZ); z <= Math.min(box.maxZ(), minZ + 15); z++)
+                        for (int x = Math.max(box.minX(), minX); x <= Math.min(box.maxX(), minX + 15); x++)
+                            built[(x - minX) | ((z - minZ) << 4)] = true;
+                }
+            }
+            return built;
+        }
+
+        private void decorateAndWrite(Sink sink, ProtoChunk chunk, @org.jetbrains.annotations.Nullable boolean[] built) {
             int minY = chunk.getMinY();
             int maxY = chunk.getMaxY();
             int minX = chunk.getPos().getMinBlockX();
@@ -218,7 +269,9 @@ public final class SeedTerrain {
                     highestSurface = Math.max(highestSurface, Math.max(surfaceY, fluidY));
                     Holder<Biome> biome = chunk.getNoiseBiome(QuartPos.fromBlock(wx), QuartPos.fromBlock(surfaceY), QuartPos.fromBlock(wz));
 
-                    if (!SeedTerrain.this.hasCeiling) {
+                    // Columns under a structure tell us nothing about the biome's natural ground, and grow no trees
+                    boolean natural = built == null || !built[col];
+                    if (natural && !SeedTerrain.this.hasCeiling) {
                         if (fluidY != Integer.MIN_VALUE) {
                             SeedTerrain.this.traits.learnUnderwater(biome, surface);
                         } else if (surfaceY > minY) {
@@ -227,7 +280,7 @@ public final class SeedTerrain {
                     }
 
                     int top = surfaceY;
-                    if (fluidY == Integer.MIN_VALUE && SeedTerrain.this.trees && x >= 2 && x <= 13 && z >= 2 && z <= 13
+                    if (natural && fluidY == Integer.MIN_VALUE && SeedTerrain.this.trees && x >= 2 && x <= 13 && z >= 2 && z <= 13
                             && BiomeTraits.canHoldTree(surface)) {
                         var t = SeedTerrain.this.traits.trees(biome, biome.value().getGenerationSettings());
                         if (t.density() > 0 && chance(SeedTerrain.this.seed, wx, wz, 1) < t.density()) {

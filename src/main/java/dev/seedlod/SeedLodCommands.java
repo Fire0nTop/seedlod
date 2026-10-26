@@ -65,6 +65,7 @@ public final class SeedLodCommands {
                         .then(boolOption("nSized", (c, v) -> c.nSized = v, c -> c.nSized))
                         .then(boolOption("trees", (c, v) -> c.trees = v, c -> c.trees))
                         .then(boolOption("waterFeatures", (c, v) -> c.waterFeatures = v, c -> c.waterFeatures))
+                        .then(boolOption("structures", (c, v) -> c.structures = v, c -> c.structures))
                         .then(boolOption("debug", (c, v) -> c.debug = v, c -> c.debug))));
     }
 
@@ -85,8 +86,8 @@ public final class SeedLodCommands {
     private static int showConfig(CommandContext<FabricClientCommandSource> ctx) {
         var c = SeedLodConfig.INSTANCE;
         ctx.getSource().sendFeedback(Component.literal(String.format(
-                "SeedLOD: distance=%d detailRadius=%d threads=%d continuous=%b nSized=%b trees=%b waterFeatures=%b debug=%b",
-                c.distance, c.detailRadius, c.threads, c.continuous, c.nSized, c.trees, c.waterFeatures, c.debug)));
+                "SeedLOD: distance=%d detailRadius=%d threads=%d continuous=%b nSized=%b trees=%b waterFeatures=%b structures=%b debug=%b",
+                c.distance, c.detailRadius, c.threads, c.continuous, c.nSized, c.trees, c.waterFeatures, c.structures, c.debug)));
         return 1;
     }
 

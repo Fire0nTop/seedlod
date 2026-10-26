@@ -20,6 +20,14 @@ import net.minecraft.core.RegistryAccess;
 import net.minecraft.world.level.levelgen.WorldOptions;
 import org.jetbrains.annotations.Nullable;
 
+import dev.seedlod.SeedLod;
+import net.fabricmc.loader.api.FabricLoader;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.util.datafix.DataFixers;
+import net.minecraft.world.level.levelgen.structure.templatesystem.StructureTemplateManager;
+import net.minecraft.world.level.storage.LevelStorageSource;
+
+import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.OptionalLong;
@@ -37,10 +45,15 @@ public final class VanillaWorldgen {
 
     private final RegistryAccess.Frozen registries;
     private final ResourceKey<WorldPreset> preset;
+    // Kept open: structure templates (villages, bastions...) are read from it on demand
+    private final MultiPackResourceManager resources;
+    @Nullable private volatile StructureTemplateManager templates;
+    private boolean templatesFailed;
 
-    private VanillaWorldgen(RegistryAccess.Frozen registries, ResourceKey<WorldPreset> preset) {
+    private VanillaWorldgen(RegistryAccess.Frozen registries, ResourceKey<WorldPreset> preset, MultiPackResourceManager resources) {
         this.registries = registries;
         this.preset = preset;
+        this.resources = resources;
     }
 
     /** Slow (a second or two): reads and decodes vanilla's worldgen JSON. Call off the render thread. */
@@ -48,13 +61,38 @@ public final class VanillaWorldgen {
         var repository = ServerPacksSource.createVanillaTrustedRepository();
         repository.reload();
         repository.setSelected(List.of("vanilla"));
-        try (var resources = new MultiPackResourceManager(PackType.SERVER_DATA, repository.openAllSelected())) {
+        var resources = new MultiPackResourceManager(PackType.SERVER_DATA, repository.openAllSelected());
+        try {
             var layers = RegistryLayer.createRegistryAccess();
             var staticTags = TagLoader.loadTagsForExistingRegistries(resources, layers.getLayer(RegistryLayer.STATIC));
             var context = TagLoader.buildUpdatedLookups(layers.getAccessForLoading(RegistryLayer.WORLD), staticTags);
             var world = RegistryDataLoader.load(resources, context, RegistryDataLoader.WORLD_REGISTRIES, Runnable::run).join();
-            return new VanillaWorldgen(world, preset);
+            // Structures also look up built-in registries (blocks, ...) through the same access, so combine the layers
+            var all = layers.replaceFrom(RegistryLayer.WORLD, world).compositeAccess();
+            return new VanillaWorldgen(all, preset, resources);
+        } catch (RuntimeException e) {
+            resources.close();
+            throw e;
         }
+    }
+
+    /**
+     * Template manager reading vanilla structure NBT from the game jar. It insists on a world folder (for
+     * player-made templates), so it gets an empty one of its own.
+     */
+    @Nullable
+    private synchronized StructureTemplateManager templates() {
+        if (this.templates == null && !this.templatesFailed) {
+            try {
+                Path dir = FabricLoader.getInstance().getConfigDir().resolve("seedlod").resolve("templates");
+                var access = LevelStorageSource.createDefault(dir).createAccess(this.preset.identifier().getPath());
+                this.templates = new StructureTemplateManager(this.resources, access, DataFixers.getDataFixer(), BuiltInRegistries.BLOCK);
+            } catch (Exception e) {
+                this.templatesFailed = true;
+                SeedLod.LOGGER.error("Couldn't set up structure templates; structures will be skipped", e);
+            }
+        }
+        return this.templates;
     }
 
     public ResourceKey<WorldPreset> preset() {
@@ -70,8 +108,9 @@ public final class VanillaWorldgen {
         if (stem == null || !(stem.generator() instanceof NoiseBasedChunkGenerator generator)) return null;
         var type = stem.type().value();
         var randomState = RandomState.create(this.registries.lookupOrThrow(Registries.NOISE), seed, generator.generatorSettings().value());
+        var structureState = generator.createState(this.registries.lookupOrThrow(Registries.STRUCTURE_SET), randomState, seed);
         return new GenContext(generator, randomState, seed, LevelHeightAccessor.create(type.minY(), type.height()),
-                PalettedContainerFactory.create(this.registries), type.hasCeiling());
+                PalettedContainerFactory.create(this.registries), type, dimension, this.registries, structureState, this.templates());
     }
 
     /** Same parsing as the "Seed for the world generator" box: numbers as-is, anything else hashed. */

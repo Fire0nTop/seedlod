@@ -28,6 +28,8 @@ public class SeedLodConfig {
     public boolean trees = true;
     // Ice sheets on cold water and snow on cold land
     public boolean waterFeatures = true;
+    // Villages, temples, monuments, bastions, End cities... (only ones visible in an LOD)
+    public boolean structures = true;
     public boolean debug = false;
     // Multiplayer: what we know about each server's world, keyed by server address
     public Map<String, ServerWorld> servers = new HashMap<>();
@@ -37,6 +39,9 @@ public class SeedLodConfig {
         public String preset = "normal";
         // Use the seed even though it doesn't match the hash the server sent (some servers send a fake one)
         public boolean force;
+        // Fair-play markers this server sent (see ServerRules); remembered for direct connects without a MOTD
+        public boolean noStructures;
+        public boolean disabled;
     }
 
     public static void load() {
