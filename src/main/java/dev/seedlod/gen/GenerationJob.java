@@ -37,6 +37,16 @@ public final class GenerationJob {
     private volatile long[] protectedChunks = new long[0];
     private volatile int protectRadius;
 
+    // Chunks of structures that reach past the radius, generated after it (any part generated means all of it is)
+    private final java.util.concurrent.ConcurrentLinkedQueue<Long> structureOverflow = new java.util.concurrent.ConcurrentLinkedQueue<>();
+    private final java.util.Set<Long> overflowQueued = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    // Chunks skipped for being near a player, by chunk key -> offset. The game was about to load them, but a player
+    // moving fast (or just arriving through a portal) can leave before it does; retried after everything else.
+    private final java.util.concurrent.ConcurrentHashMap<Long, Long> deferred = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final long DEFERRED_PATIENCE_MS = 20_000;
+    private volatile long deferredGiveUpAt;
+
     // Ring iterator state (guarded by this)
     private int ring = 0;
     private int ringIndex = 0;
@@ -153,7 +163,18 @@ public final class GenerationJob {
             this.ring++;
             this.ringIndex = 0;
         }
+        // Then the parts of structures that stick out past the radius, so no structure is cut off at the edge
+        Long extra = this.structureOverflow.poll();
+        if (extra != null) return ChunkPos.pack(ChunkPos.getX(extra) - this.centerX, ChunkPos.getZ(extra) - this.centerZ);
         return Long.MIN_VALUE;
+    }
+
+    private void queueRestOfStructures(int cx, int cz) {
+        long r2 = (long) this.settings.radius * this.settings.radius;
+        this.terrain.forEachStructureChunk(cx, cz, key -> {
+            long dx = ChunkPos.getX(key) - this.centerX, dz = ChunkPos.getZ(key) - this.centerZ;
+            if (dx * dx + dz * dz > r2 && this.overflowQueued.add(key)) this.structureOverflow.add(key);
+        });
     }
 
     private int targetLevel(int dx, int dz) {
@@ -181,6 +202,7 @@ public final class GenerationJob {
         long lastSave = System.currentTimeMillis();
         while (!this.stopped.get()) {
             long off = this.nextOffset();
+            if (off == Long.MIN_VALUE) off = this.nextDeferred();
             if (off == Long.MIN_VALUE) break;
             int dx = ChunkPos.getX(off), dz = ChunkPos.getZ(off);
             int cx = this.centerX + dx, cz = this.centerZ + dz;
@@ -189,10 +211,16 @@ public final class GenerationJob {
 
             int lvl = this.targetLevel(dx, dz);
             // A structure needs its real blocks; Voxy shrinks them down for the distance like any other terrain
-            if (lvl > 0 && this.terrain.structuresTouch(cx, cz)) lvl = 0;
+            if (this.terrain.structuresTouch(cx, cz)) {
+                lvl = 0;
+                this.queueRestOfStructures(cx, cz);
+            }
             byte previous = this.done.get(key);
             if (previous <= lvl) continue;
-            if (this.isProtected(cx, cz)) continue;
+            if (this.isProtected(cx, cz)) {
+                this.deferred.put(key, off);
+                continue;
+            }
             // Data we didn't write ourselves is real terrain; data we did write may be refined
             if ((this.explored != null && this.explored.isExplored(cx, cz))
                     || (previous == DoneMap.NONE && this.stored.has(cx, cz))) {
@@ -231,6 +259,34 @@ public final class GenerationJob {
                 this.done.save();
             }
         }
+    }
+
+    /**
+     * A skipped chunk that is now safe to generate: the player moved away and the game never loaded it (a loaded one
+     * gets marked as real terrain and is dropped). Waits a little for the player to move; gives up after a while
+     * without progress, a later job will see them again.
+     */
+    private long nextDeferred() {
+        while (!this.stopped.get() && !this.deferred.isEmpty()) {
+            long now = System.currentTimeMillis();
+            if (this.deferredGiveUpAt == 0) this.deferredGiveUpAt = now + DEFERRED_PATIENCE_MS;
+            for (var e : this.deferred.entrySet()) {
+                long key = e.getKey();
+                if (this.done.get(key) == DoneMap.REAL) {
+                    this.deferred.remove(key);
+                } else if (!this.isProtected(ChunkPos.getX(key), ChunkPos.getZ(key)) && this.deferred.remove(key) != null) {
+                    this.deferredGiveUpAt = now + DEFERRED_PATIENCE_MS;
+                    return e.getValue();
+                }
+            }
+            if (now > this.deferredGiveUpAt) return Long.MIN_VALUE;
+            try {
+                Thread.sleep(250);
+            } catch (InterruptedException ex) {
+                return Long.MIN_VALUE;
+            }
+        }
+        return Long.MIN_VALUE;
     }
 
     public String describe() {

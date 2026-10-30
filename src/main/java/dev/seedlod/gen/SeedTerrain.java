@@ -107,9 +107,29 @@ public final class SeedTerrain {
         return this.structures != null;
     }
 
+    /** Every chunk covered by the structures touching this chunk, including their terrain-shaping margin. */
+    public void forEachStructureChunk(int cx, int cz, java.util.function.LongConsumer out) {
+        if (this.structures == null) return;
+        for (var start : this.structures.affecting(cx, cz)) {
+            var box = start.getStructure().adjustBoundingBox(start.getBoundingBox());
+            for (int z = box.minZ() >> 4; z <= box.maxZ() >> 4; z++)
+                for (int x = box.minX() >> 4; x <= box.maxX() >> 4; x++)
+                    out.accept(ChunkPos.pack(x, z));
+        }
+    }
+
     /** Chunks a structure touches are always generated at full detail, so the structure is really there. */
     public boolean structuresTouch(int cx, int cz) {
         return this.structures != null && !this.structures.affecting(cx, cz).isEmpty();
+    }
+
+    private static final java.util.Set<String> WARNED = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    // Usually an entity a structure wanted to spawn (shulker, item frame); its blocks are already placed by then
+    private static void warnOnce(String what, Exception e) {
+        if (WARNED.add(what)) {
+            SeedLod.LOGGER.debug("Part of a {} couldn't be placed outside a real world (reported once): {}", what, e.toString());
+        }
     }
 
     public Worker newWorker() {
@@ -134,6 +154,7 @@ public final class SeedTerrain {
 
     public final class Worker implements AutoCloseable {
         private final VoxelizedSection section = VoxelizedSection.createEmpty();
+        private final StructureLevel.HeightCache heights = new StructureLevel.HeightCache();
         private net.minecraft.world.level.levelgen.densityfunction.DensityBufferPool coarsePool;
         private net.minecraft.world.level.levelgen.densityfunction.DensitySampler.Bound coarseDensity;
 
@@ -204,17 +225,12 @@ public final class SeedTerrain {
             // Seeded like vanilla decoration, so the same seed always gives the same structure details
             var random = new WorldgenRandom(new XoroshiroRandomSource(0L));
             long decorationSeed = random.setDecorationSeed(t.seed, minX, minZ);
-            var level = StructureLevel.create(chunk, t.ctx, biomes, random);
+            var level = StructureLevel.create(chunk, t.ctx, biomes, random, this.heights);
             boolean[] built = new boolean[256];
             for (int i = 0; i < starts.size(); i++) {
                 StructureStart start = starts.get(i);
                 random.setFeatureSeed(decorationSeed, i, start.getStructure().step().ordinal());
-                try {
-                    start.placeInChunk(level, null, t.generator, random, chunkBox, pos);
-                } catch (Exception e) {
-                    // A piece wanting something only a real world has; the rest of the structure still stands
-                    SeedLod.LOGGER.debug("Structure piece failed in chunk {}", pos, e);
-                }
+                this.placeStart(level, start, random, chunkBox, pos);
                 for (var piece : start.getPieces()) {
                     var box = piece.getBoundingBox();
                     if (!box.intersects(chunkBox)) continue;
@@ -224,6 +240,33 @@ public final class SeedTerrain {
                 }
             }
             return built;
+        }
+
+        /**
+         * StructureStart#placeInChunk, but every piece in its own try: rooms ask the world for things only a real one has
+         * (an End city room spawns its shulker after placing its blocks), and one such failure must not drop the
+         * rest of the structure.
+         */
+        private void placeStart(net.minecraft.world.level.WorldGenLevel level, StructureStart start, WorldgenRandom random,
+                                BoundingBox chunkBox, ChunkPos pos) {
+            var pieces = start.getPieces();
+            if (pieces.isEmpty()) return;
+            var center = pieces.getFirst().getBoundingBox();
+            var referencePos = new BlockPos(center.getCenter().getX(), center.minY(), center.getCenter().getZ());
+            for (var piece : pieces) {
+                if (!piece.getBoundingBox().intersects(chunkBox)) continue;
+                try {
+                    piece.postProcess(level, null, SeedTerrain.this.generator, random, chunkBox, pos, referencePos);
+                } catch (Exception e) {
+                    warnOnce(piece.getClass().getSimpleName(), e);
+                }
+            }
+            try {
+                start.getStructure().afterPlace(level, null, SeedTerrain.this.generator, random, chunkBox, pos,
+                        new net.minecraft.world.level.levelgen.structure.pieces.PiecesContainer(pieces));
+            } catch (Exception e) {
+                warnOnce(start.getStructure().getClass().getSimpleName(), e);
+            }
         }
 
         private void decorateAndWrite(Sink sink, ProtoChunk chunk, @org.jetbrains.annotations.Nullable boolean[] built) {

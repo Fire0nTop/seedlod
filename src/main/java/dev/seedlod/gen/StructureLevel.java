@@ -36,8 +36,32 @@ final class StructureLevel implements InvocationHandler {
     private final BiomeResolver biomes;
     private final RandomSource random;
     private final int minX, minZ;
+    private final HeightCache heights;
 
-    private StructureLevel(ProtoChunk chunk, GenContext ctx, BiomeResolver biomes, RandomSource random) {
+    /**
+     * Column heights outside the chunk, from the noise generator. Computing one costs a column of density samples and
+     * some pieces (mansions) ask tens of thousands of times, so each worker keeps the answers across chunks.
+     */
+    static final class HeightCache {
+        private static final int MAX = 200_000;
+        private final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap surface = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
+        private final it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap oceanFloor = new it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap();
+
+        int get(GenContext ctx, Heightmap.Types type, int x, int z) {
+            var map = type == Heightmap.Types.OCEAN_FLOOR_WG ? this.oceanFloor : this.surface;
+            long key = BlockPos.asLong(x, 0, z);
+            int h = map.getOrDefault(key, Integer.MIN_VALUE);
+            if (h == Integer.MIN_VALUE) {
+                if (map.size() > MAX) map.clear();
+                h = ctx.generator().getBaseHeight(x, z, type, ctx.heightAccessor(), ctx.randomState());
+                map.put(key, h);
+            }
+            return h;
+        }
+    }
+
+    private StructureLevel(ProtoChunk chunk, GenContext ctx, BiomeResolver biomes, RandomSource random, HeightCache heights) {
+        this.heights = heights;
         this.chunk = chunk;
         this.ctx = ctx;
         this.biomes = biomes;
@@ -46,9 +70,9 @@ final class StructureLevel implements InvocationHandler {
         this.minZ = chunk.getPos().getMinBlockZ();
     }
 
-    static WorldGenLevel create(ProtoChunk chunk, GenContext ctx, BiomeResolver biomes, RandomSource random) {
+    static WorldGenLevel create(ProtoChunk chunk, GenContext ctx, BiomeResolver biomes, RandomSource random, HeightCache heights) {
         return (WorldGenLevel) Proxy.newProxyInstance(StructureLevel.class.getClassLoader(), new Class<?>[]{WorldGenLevel.class},
-                new StructureLevel(chunk, ctx, biomes, random));
+                new StructureLevel(chunk, ctx, biomes, random, heights));
     }
 
     private boolean inside(BlockPos pos) {
@@ -72,7 +96,7 @@ final class StructureLevel implements InvocationHandler {
         if (x - this.minX >= 0 && x - this.minX < 16 && z - this.minZ >= 0 && z - this.minZ < 16) {
             return this.chunk.getOrCreateHeightmapUnprimed(type).getFirstAvailable(x & 15, z & 15);
         }
-        return this.ctx.generator().getBaseHeight(x, z, type, this.ctx.heightAccessor(), this.ctx.randomState());
+        return this.heights.get(this.ctx, type, x, z);
     }
 
     @Override

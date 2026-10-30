@@ -466,23 +466,24 @@ public final class GenerationManager {
     }
 
     private long[] playerChunks(Minecraft mc) {
+        var out = new it.unimi.dsi.fastutil.longs.LongArrayList();
+        // Our own position always counts: right after a portal the server may not list us in the new world yet,
+        // and on a server it's the only position we know
+        if (mc.player != null && mc.level != null && mc.level.dimension() == this.jobDimension) {
+            var p = mc.player.chunkPosition();
+            out.add(ChunkPos.pack(p.x(), p.z()));
+        }
         var server = mc.getSingleplayerServer();
         if (server != null && this.jobDimension != null) {
             var level = server.getLevel(this.jobDimension);
             if (level != null) {
-                var players = level.players();
-                long[] out = new long[players.size()];
-                for (int i = 0; i < out.length; i++) {
-                    ChunkPos p = players.get(i).chunkPosition();
-                    out[i] = ChunkPos.pack(p.x(), p.z());
+                for (var player : level.players()) {
+                    ChunkPos p = player.chunkPosition();
+                    out.add(ChunkPos.pack(p.x(), p.z()));
                 }
-                return out;
             }
         }
-        // On a server we only know where we are; other players' chunks get ingested only if we see them anyway
-        if (mc.player == null) return new long[0];
-        var p = mc.player.chunkPosition();
-        return new long[]{ChunkPos.pack(p.x(), p.z())};
+        return out.toLongArray();
     }
 
     private int protectRadius(Minecraft mc) {

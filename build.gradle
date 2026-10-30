@@ -31,6 +31,11 @@ dependencies {
     // Voxy is the LOD engine we write into; Sodium is its hard dependency.
     implementation "maven.modrinth:voxy:${project.voxy_version}"
     runtimeOnly "maven.modrinth:sodium:${project.sodium_version}"
+
+    // Dev client only, for looking at distant terrain; never bundled into SeedLOD
+    runtimeOnly "maven.modrinth:zoomify:2.17.0+mc26.3"
+    runtimeOnly "maven.modrinth:yacl:3.9.7+26.3-fabric"
+    runtimeOnly "maven.modrinth:fabric-language-kotlin:1.14.2+kotlin.2.4.21"
 }
 
 processResources {
